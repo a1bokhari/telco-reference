@@ -5,7 +5,7 @@
 Ensure to include `--recurse-submodules` option while cloning this repo in order to pick the content from the git sub-modules included in the repository.
 
 ```bash
-git clone --recurse-submodules https://github.com/openshift-kni/telco-reference.git -b tnc-6.1-release-4.20
+git clone --recurse-submodules https://github.com/openshift-kni/telco-reference.git -b tnc6.1-release-4.20
 ```
 
 ====
