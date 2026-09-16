@@ -1,0 +1,447 @@
+= Upgrading CWL clusters from 4.20.16 to 4.22.5
+:toc:
+:toclevels: 3
+
+This guide covers the full EUS-style double upgrade for TNC Core Workload (CWL) clusters:
+
+*4.20.16 → 4.21.24 → 4.22.5*
+
+Worker MachineConfigPools (MCPs) stay *paused* through both control-plane hops and are released once after the 4.22.5 hop succeeds.
+
+Lab reference cluster: `cwl-site1`, managed by hub `mgmt1`.
+
+For upgrading the management hub itself, see link:../../tnc-mgmt-ztp/configuration/upgrade-mgmt-422.adoc[upgrade-mgmt-422.adoc].
+
+Day-2 and upgrade artifacts are split across Git branches consumed by the ArgoCD application `cwl-policies`:
+
+| OpenShift / TNC steady state | Git branch (`targetRevision`) |
+|------------------------------|-------------------------------|
+| 4.20 / TNC 6.1 | `tnc6.1-release-4.20` |
+| 4.22 / TNC 7.0 (+ upgrade PolicyGenerators) | `tnc7.0-release-4.22` |
+
+Switching that application from the 6.1 branch to the 7.0 branch is a required step in this procedure.
+
+== Overview
+
+Upgrade PolicyGenerators live on `tnc7.0-release-4.22` under `tnc-reference/tnc-cwl/configuration/`:
+
+* link:cwl-upgrade-21.yaml[`cwl-upgrade-21.yaml`] — hop *4.21.24* (`cwl-upgrade-21`, label `upgrade-version-4-21`)
+* link:cwl-upgrade-22.yaml[`cwl-upgrade-22.yaml`] — hop *4.22.5* (`cwl-upgrade-22`, label `upgrade-version-4-22`)
+* link:cwl-upgrade-finish.yaml[`cwl-upgrade-finish.yaml`] — unpause workers (`upgrade-finish`)
+
+Each hop uses the same TALM sequence: *prep → ocp → olm → validate*. Finish runs only after the second hop.
+
+```
+unbind day-2 labels → point cwl-policies at tnc7.0-release-4.22 → enable upgrade generators
+       │
+       ▼
+4.20.16  --CGU cwl-upgrade-21-->  4.21.24  --CGU cwl-upgrade-22-->  4.22.5  --CGU finish-->  workers updated
+         (workers paused)                  (workers paused)                  (unpause MCPs)
+       │
+       ▼
+rebind version=4.22 and tnc-ver=tnc7.0
+```
+
+== Access
+
+[source,bash]
+----
+# Hub (mgmt1) — ManagedCluster labels, policies, CGUs, ArgoCD apps
+sudo su mano1
+oc login -u <user> -p <password> https://api.mgmt1.example.com:6443
+
+# Spoke (cwl-site1) — ClusterVersion, MCPs, operators
+sudo su cwl1
+----
+
+== Prerequisites
+
+* Spoke healthy on *4.20.16* (`oc get clusterversion`, `oc get nodes`, `oc get mcp`, `oc get co`).
+* Hub lists `cwl-site1` as Available (`oc get managedcluster cwl-site1`).
+* Upgrade artifacts committed on Git branch `tnc7.0-release-4.22` (this branch).
+* Disconnected mirror on `registry.bastion.example.com:9500` includes:
+** Release images for *4.21.24* and *4.22.5*
+** Operator indexes `:v4.21` and `:v4.22` (Red Hat and certified)
+** NUMA scheduler tags `:v4.21` and `:v4.22`
+* Confirm release digests used by the upgrade policies:
++
+[source,bash]
+----
+oc adm release info \
+  registry.bastion.example.com:9500/ocp/ocp4/openshift/release-images@sha256:9ed4f92ef5d48054797e08789b9a09ebeb9bfd9c6cb6ebba2876e4e81aa09c73 \
+  -o jsonpath='{.metadata.version}{"\n"}'
+# expect 4.21.24
+
+oc adm release info \
+  registry.bastion.example.com:9500/ocp/ocp4/openshift/release-images@sha256:e6467b367dd26e4c3d49ef8b949dba403df5bb9274fe045faf651377541f401a \
+  -o jsonpath='{.metadata.version}{"\n"}'
+# expect 4.22.5
+----
+
+* Confirm the policy app still tracks the 6.1 / 4.20 branch (starting state):
++
+[source,bash]
+----
+oc get apps -n openshift-gitops cwl-policies -o yaml | yq '.spec'
+----
++
+Expected starting `source` (example):
++
+[source,yaml]
+----
+destination:
+  namespace: policies-sub
+  server: https://kubernetes.default.svc
+project: policy-app-project
+source:
+  path: tnc-reference/tnc-cwl/configuration
+  repoURL: http://git.example.com:3300/tnc-github.git
+  targetRevision: tnc6.1-release-4.20
+syncPolicy:
+  automated:
+    prune: true
+    selfHeal: true
+  syncOptions:
+    - CreateNamespace=true
+----
+
+[#conflict-avoidance]
+== Conflict avoidance (unbind day-2 *before* switching GitOps)
+
+Starting cluster labels (example `cwl-site1` on 4.20 / TNC 6.1):
+
+* RDS day-2 (`core-baseline` / `core-overlay` on `tnc6.1-release-4.20`): `version=4.20`
+* TNC day-2 (`cwl-additions`, odf, kafka, auth, lab): `tnc-ver=tnc6.1` (implies OCP 4.20 pins)
+
+Branch `tnc7.0-release-4.22` already ships day-2 PolicyGenerators for *4.22* / `tnc-ver=tnc7.0`. If you point `cwl-policies` at that branch while those labels are still set to 4.20 / tnc6.1 *or* you prematurely set `version=4.22` / `tnc-ver=tnc7.0`, day-2 can fight the upgrade policies.
+
+| Family | Unbind before GitOps switch | Rebind after finish |
+|--------|-----------------------------|---------------------|
+| RDS | remove `version` | `version=4.22` |
+| TNC | remove `tnc-ver` | `tnc-ver=tnc7.0` |
+
+[source,bash]
+----
+# Unbind 4.20 / TNC 6.1 day-2 (do this BEFORE changing cwl-policies targetRevision)
+oc label managedcluster cwl-site1 version-
+oc label managedcluster cwl-site1 tnc-ver-
+
+oc get managedcluster cwl-site1 --show-labels | tr ',' '\n' | grep -E 'version|tnc-ver' || echo "version/tnc-ver cleared"
+----
+
+Leave those labels unset through both hops and finish. Do *not* add a redundant `version` selector to `cwl-additions`; `tnc-ver` is the TNC gate.
+
+[#gitops-switch]
+== Switch the policy app to `tnc7.0-release-4.22`
+
+The ArgoCD application `cwl-policies` renders CWL configuration from Git. Move it from the 4.20 / TNC 6.1 branch to the 4.22 / TNC 7.0 branch so upgrade PolicyGenerators and post-upgrade day-2 pins are available on the hub.
+
+. On `tnc7.0-release-4.22`, uncomment the upgrade generators in link:kustomization.yaml[`kustomization.yaml`] and push if needed:
++
+[source,yaml]
+----
+generators:
+  # ...
+  - cwl-upgrade-21.yaml
+  - cwl-upgrade-22.yaml
+  - cwl-upgrade-finish.yaml
+----
+
+. Point `cwl-policies` at the 7.0 branch.
++
+If the ArgoCD Application is managed only on the hub (not owned by another GitOps path), you can patch it live (as `mano1`):
++
+[source,bash]
+----
+oc get apps -n openshift-gitops cwl-policies -o yaml | yq '.spec.source'
+
+oc patch application cwl-policies -n openshift-gitops --type=merge -p '
+spec:
+  source:
+    targetRevision: tnc7.0-release-4.22
+'
+
+# Confirm
+oc get apps -n openshift-gitops cwl-policies -o yaml | yq '.spec.source'
+# path: tnc-reference/tnc-cwl/configuration
+# repoURL: http://git.example.com:3300/tnc-github.git
+# targetRevision: tnc7.0-release-4.22
+----
++
+[IMPORTANT]
+====
+If management-cluster ArgoCD settings (including the `cwl-policies` / policies Application `targetRevision`) are defined by *kustomize* and synced by GitOps, change them in that Git source of truth — not with a one-off `oc patch` on the hub. A live patch will be reverted when the owning app self-heals.
+
+For lab hub `mgmt1`, those settings are delivered by the *global hub* policy app; update the corresponding kustomize overlay / PolicyGenerator patches there (for example the policies Application `source.targetRevision`), commit/push, and wait for that path to sync to `mgmt1` so `cwl-policies` picks up `tnc7.0-release-4.22`.
+====
+
+. Wait for sync (automated selfHeal is enabled) or refresh manually in the GitOps UI / CLI:
++
+[source,bash]
+----
+oc get apps -n openshift-gitops cwl-policies
+# expect Synced / Healthy once the new revision is applied
+----
+
+. Verify upgrade policies exist on the hub:
++
+[source,bash]
+----
+oc get policies -n ztp-core-policies | grep cwl-upgrade
+# cwl-upgrade-prep-21|ocp-21|olm-21|validate-21
+# cwl-upgrade-prep-22|ocp-22|olm-22|validate-22
+# cwl-upgrade-workers-1|2|3
+----
+
+[NOTE]
+====
+With `prune: true`, policies that existed only on `tnc6.1-release-4.20` and are absent from `tnc7.0-release-4.22` are removed from the hub on sync. That is expected: day-2 selection for this cluster remains off until `version` / `tnc-ver` are restored after finish.
+====
+
+[#hop21]
+== Hop 1: 4.20.16 → 4.21.24
+
+=== Bind and enforce
+
+[source,bash]
+----
+oc label managedcluster cwl-site1 upgrade-version-4-21=""
+----
+
+Apply CGU:
+
+[source,yaml]
+----
+apiVersion: ran.openshift.io/v1alpha1
+kind: ClusterGroupUpgrade
+metadata:
+  name: cwl-upgrade-21
+  namespace: default
+spec:
+  actions:
+    afterCompletion:
+      deleteClusterLabels:
+        upgrade-version-4-21: ""
+      deleteObjects: true
+  clusters:
+  - cwl-site1
+  enable: true
+  managedPolicies:
+  - cwl-upgrade-prep-21
+  - cwl-upgrade-ocp-21
+  - cwl-upgrade-olm-21
+  - cwl-upgrade-validate-21
+  remediationStrategy:
+    maxConcurrency: 1
+    timeout: 480
+----
+
+[source,bash]
+----
+oc apply -f cwl-upgrade-21-cgu.yaml
+oc get clustergroupupgrade -n default cwl-upgrade-21 -w
+----
+
+Prep remediates Red Hat *and* certified catalogs to `:v4.21`, pauses worker MCPs. OCP remediates to *4.21.24*. OLM moves ODF to `stable-4.21`, NROP channel `4.21`, NUMA scheduler image `:v4.21`, and core Subscriptions to `AtLatestKnown`.
+
+=== Verify hop 1 (`cwl1`)
+
+[source,bash]
+----
+oc get clusterversion
+# 4.21.24 Available=True Progressing=False
+
+oc get mcp
+# master Updated; workers still paused
+
+oc get catalogsource -n openshift-marketplace
+# both catalogs READY at :v4.21
+
+oc get subscription -n openshift-numaresources numaresources-operator -o jsonpath='{.spec.channel}{"\n"}'
+# 4.21
+
+oc get numaresourcesscheduler numaresourcesscheduler -o jsonpath='{.spec.imageSpec}{"\n"}'
+# .../noderesourcetopology-scheduler-rhel9:v4.21
+----
+
+Leave workers paused. Do *not* restore `version` / `tnc-ver` yet.
+
+[#hop22]
+== Hop 2: 4.21.24 → 4.22.5
+
+=== Bind and enforce
+
+[source,bash]
+----
+oc label managedcluster cwl-site1 upgrade-version-4-22=""
+----
+
+[source,yaml]
+----
+apiVersion: ran.openshift.io/v1alpha1
+kind: ClusterGroupUpgrade
+metadata:
+  name: cwl-upgrade-22
+  namespace: default
+spec:
+  actions:
+    afterCompletion:
+      deleteClusterLabels:
+        upgrade-version-4-22: ""
+      deleteObjects: true
+  clusters:
+  - cwl-site1
+  enable: true
+  managedPolicies:
+  - cwl-upgrade-prep-22
+  - cwl-upgrade-ocp-22
+  - cwl-upgrade-olm-22
+  - cwl-upgrade-validate-22
+  remediationStrategy:
+    maxConcurrency: 1
+    timeout: 480
+  blockingCRs:
+  - name: cwl-upgrade-21
+    namespace: default
+----
+
+[source,bash]
+----
+oc apply -f cwl-upgrade-22-cgu.yaml
+oc get clustergroupupgrade -n default cwl-upgrade-22 -w
+----
+
+Prep moves catalogs to `:v4.22` and keeps workers paused. OCP remediates to *4.22.5*. OLM sets ODF `stable-4.22`, NROP `4.22`, NUMA scheduler `:v4.22`.
+
+=== Verify hop 2 (`cwl1`)
+
+[source,bash]
+----
+oc get clusterversion
+# 4.22.5 Available=True Progressing=False
+
+oc get catalogsource -n openshift-marketplace
+# both catalogs READY at :v4.22
+
+oc get subscription -n openshift-numaresources numaresources-operator -o jsonpath='{.spec.channel}{"\n"}'
+# 4.22
+
+oc get numaresourcesscheduler numaresourcesscheduler -o jsonpath='{.spec.imageSpec}{"\n"}'
+# .../noderesourcetopology-scheduler-rhel9:v4.22
+
+oc get mcp
+# workers still paused
+----
+
+[#finish]
+== Finish: release worker MCPs
+
+After *4.22.5* control plane is stable:
+
+[source,bash]
+----
+oc label managedcluster cwl-site1 upgrade-finish=""
+----
+
+[source,yaml]
+----
+apiVersion: ran.openshift.io/v1alpha1
+kind: ClusterGroupUpgrade
+metadata:
+  name: cwl-upgrade-finish
+  namespace: default
+spec:
+  actions:
+    afterCompletion:
+      deleteClusterLabels:
+        upgrade-finish: ""
+      deleteObjects: true
+  clusters:
+  - cwl-site1
+  enable: true
+  managedPolicies:
+  - cwl-upgrade-workers-1
+  - cwl-upgrade-workers-2
+  - cwl-upgrade-workers-3
+  remediationStrategy:
+    maxConcurrency: 1
+    timeout: 480
+  blockingCRs:
+  - name: cwl-upgrade-22
+    namespace: default
+----
+
+[source,bash]
+----
+oc apply -f cwl-upgrade-finish-cgu.yaml
+oc get clustergroupupgrade -n default cwl-upgrade-finish -w
+
+# spoke
+oc get mcp
+oc get nodes
+----
+
+Expect worker MCP(s) to unpause, update, and return to Updated=True. On `cwl-site1`, `worker-1` holds the worker node; `worker-2` / `worker-3` may be empty.
+
+[#post-hop]
+== Post-upgrade GitOps alignment
+
+`cwl-policies` should already be on `tnc7.0-release-4.22`. After finish succeeds, restore selectors so the 4.22 / TNC 7.0 day-2 policies select the cluster:
+
+[source,bash]
+----
+oc get apps -n openshift-gitops cwl-policies -o yaml | yq '.spec.source.targetRevision'
+# expect tnc7.0-release-4.22
+
+oc label managedcluster cwl-site1 version=4.22 --overwrite
+oc label managedcluster cwl-site1 tnc-ver=tnc7.0 --overwrite
+----
+
+Update install site labels if needed (for example link:../install/cwl-site1.yaml[`install/cwl-site1.yaml`]) so future syncs do not re-apply `version=4.20` / `tnc-ver=tnc6.1`.
+
+After the labels are restored, day-2 policies select the cluster again in *inform* mode. Enforce any remaining NonCompliant policies with a CGU (ordered by `ztp-deploy-wave`):
+
+[source,yaml]
+----
+apiVersion: ran.openshift.io/v1alpha1
+kind: ClusterGroupUpgrade
+metadata:
+  name: cwl-day2-align
+  namespace: default
+spec:
+  actions:
+    afterCompletion:
+      deleteObjects: true
+  clusters:
+  - cwl-site1
+  enable: true
+  managedPolicies:
+  - core-overlay-base-4.22
+  - core-operator-subs-4.22
+  - core-operator-config-4.22
+  - core-overlay-config-4.22
+  - config-odf-ext-tnc70
+  - config-other-ext-tnc70
+  - cwl-auth-idm-tnc70
+  remediationStrategy:
+    maxConcurrency: 1
+    timeout: 480
+----
+
+[source,bash]
+----
+oc apply -f cwl-day2-align-cgu.yaml
+oc get clustergroupupgrade -n default cwl-day2-align -w
+oc get policies -n cwl-site1 | grep Non || echo "all Compliant"
+----
+
+Optionally comment the upgrade generators back out of `kustomization.yaml` when no other clusters need them (placements are label-gated), then allow ArgoCD to sync.
+
+== What not to do
+
+* Do *not* change `cwl-policies` `targetRevision` to `tnc7.0-release-4.22` while `version=4.20` / `tnc-ver=tnc6.1` are still set — or while `version=4.22` / `tnc-ver=tnc7.0` are set before finish — without understanding day-2 vs upgrade conflicts.
+* Do *not* unpause workers between the 4.21 and 4.22 hops.
+* Do *not* skip 4.21.24 (y-stream must be sequential).
+* Do *not* leave `version=4.20` / `tnc-ver=tnc6.1` bound during CGUs.
+* Do *not* bind `version=4.22` / `tnc-ver=tnc7.0` until both hops and finish complete.
+* Do *not* point `cwl-policies` back at `tnc6.1-release-4.20` after the cluster is on 4.22.

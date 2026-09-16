@@ -1,0 +1,531 @@
+= Upgrading the management hub (`mgmt1`) from 4.20.16 to 4.22.5
+:toc:
+:toclevels: 3
+
+This guide covers the full EUS-style double upgrade for the TNC management hub cluster:
+
+*4.20.16 → 4.21.24 → 4.22.5*
+
+Worker MachineConfigPools (MCPs) stay *paused* through both control-plane hops and are released once after the 4.22.5 hop succeeds.
+
+Lab reference cluster: `mgmt1` (ACM hub and GitOps controller for spoke clusters such as `cwl-site1`).
+
+For CWL spoke upgrades, see link:../../tnc-cwl/configuration/upgrade-422.adoc[upgrade-422.adoc].
+
+Day-2 and upgrade artifacts for the hub are delivered by the global hub GitOps path. The ArgoCD application `policies` renders `tnc-reference/tnc-mgmt-ztp/configuration` from Git:
+
+| OpenShift / TNC steady state | Git branch (`targetRevision`) |
+|------------------------------|-------------------------------|
+| 4.20 / TNC 6.1 | `tnc6.1-release-4.20` |
+| 4.22 / TNC 7.0 (+ upgrade PolicyGenerators) | `tnc7.0-release-4.22` |
+
+Switching that application from the 6.1 branch to the 7.0 branch is a required step in this procedure.
+
+== Overview
+
+Upgrade PolicyGenerators live on `tnc7.0-release-4.22` under `tnc-reference/tnc-mgmt-ztp/configuration/`:
+
+* link:mgmt-ztp-upgrade-21.yaml[`mgmt-ztp-upgrade-21.yaml`] — hop *4.21.24* (label `upgrade-version-4-21`, selector `mgmt: "true"`)
+* link:mgmt-ztp-upgrade-22.yaml[`mgmt-ztp-upgrade-22.yaml`] — hop *4.22.5* (`upgrade-version-4-22`)
+* link:mgmt-ztp-upgrade-finish.yaml[`mgmt-ztp-upgrade-finish.yaml`] — unpause workers (`upgrade-finish`)
+
+CGU manifests:
+
+* link:upgrade-cgus/mgmt-upgrade-21-cgu.yaml[`mgmt-upgrade-21-cgu.yaml`]
+* link:upgrade-cgus/mgmt-upgrade-22-cgu.yaml[`mgmt-upgrade-22-cgu.yaml`]
+
+Each hop extends the standard TALM sequence with *subscription delete/reinstall* policies where day-2 Manual approval blocks in-place operator upgrades (logging on hop 1; ODF on both hops). Finish runs only after the second hop.
+
+[cols="1,3",options="header"]
+|===
+| Hop | Policy order
+
+| 4.21.24
+| `mgmt-ztp-upgrade-prep-21` → `mgmt-ztp-upgrade-logging-uninstall-21` → `mgmt-ztp-upgrade-logging-install-21` → `mgmt-ztp-upgrade-ocp-21` → `mgmt-ztp-upgrade-odf-uninstall-21` → `mgmt-ztp-upgrade-odf-install-21` → `mgmt-ztp-upgrade-olm-21` → `mgmt-ztp-upgrade-validate-21`
+
+| 4.22.5
+| `mgmt-ztp-upgrade-prep-22` → `mgmt-ztp-upgrade-ocp-22` → `mgmt-ztp-upgrade-odf-uninstall-22` → `mgmt-ztp-upgrade-odf-install-22` → `mgmt-ztp-upgrade-olm-22` → `mgmt-ztp-upgrade-validate-22`
+|===
+
+```
+unbind day-2 labels → point policies app at tnc7.0-release-4.22 → enable upgrade generators
+       │
+       ▼
+4.20.16  --CGU mgmt-upgrade-21-->  4.21.24  --CGU mgmt-upgrade-22-->  4.22.5  --CGU finish-->  workers updated
+         (workers paused)                  (workers paused)                  (unpause MCPs)
+       │
+       ▼
+rebind tnc-ver=tnc7.0
+```
+
+== Access
+
+[source,bash]
+----
+# Hub cluster (mgmt1) — ManagedCluster labels, policies, CGUs, operators
+sudo su mano1
+oc login -u <user> -p <password> https://api.mgmt1.example.com:6443
+----
+
+== Prerequisites
+
+* Hub healthy on *4.20.16* (`oc get clusterversion`, `oc get nodes`, `oc get mcp`, `oc get co`).
+* `mgmt1` ManagedCluster is Available (`oc get managedcluster mgmt1`).
+* Upgrade artifacts committed on Git branch `tnc7.0-release-4.22`.
+* Disconnected mirror on `registry.bastion.example.com:9500` includes:
+** Release images for *4.21.24* and *4.22.5*
+** Operator indexes `:v4.21` and `:v4.22` (Red Hat and certified)
+* Confirm release digests used by the upgrade policies:
++
+[source,bash]
+----
+oc adm release info \
+  registry.bastion.example.com:9500/ocp/ocp4/openshift/release-images@sha256:9ed4f92ef5d48054797e08789b9a09ebeb9bfd9c6cb6ebba2876e4e81aa09c73 \
+  -o jsonpath='{.metadata.version}{"\n"}'
+# expect 4.21.24
+
+oc adm release info \
+  registry.bastion.example.com:9500/ocp/ocp4/openshift/release-images@sha256:e6467b367dd26e4c3d49ef8b949dba403df5bb9274fe045faf651377541f401a \
+  -o jsonpath='{.metadata.version}{"\n"}'
+# expect 4.22.5
+----
+
+* Confirm the hub `policies` app still tracks the 6.1 / 4.20 branch (starting state):
++
+[source,bash]
+----
+oc get apps -n openshift-gitops policies -o yaml | yq '.spec'
+----
++
+Expected starting `source` (example):
++
+[source,yaml]
+----
+destination:
+  namespace: ztp-hub-policy
+  server: https://kubernetes.default.svc
+project: policy-app-project
+source:
+  path: tnc-reference/tnc-mgmt-ztp/configuration
+  repoURL: http://git.example.com:3300/tnc-github.git
+  targetRevision: tnc7.0-release-4.22
+syncPolicy:
+  automated:
+    prune: true
+    selfHeal: true
+  syncOptions:
+    - CreateNamespace=true
+----
+
+[#conflict-avoidance]
+== Conflict avoidance (unbind day-2 *before* switching GitOps)
+
+Starting cluster labels (example `mgmt1` on 4.20 / TNC 6.1):
+
+* Hub day-2 (`mgmt-baseline`, ODF, kafka, auth, ZTP, optional): `tnc-ver=tnc6.1` (and feature selectors such as `odf-int`, `kafka`, `idm`, `optional`)
+
+Branch `tnc7.0-release-4.22` ships day-2 PolicyGenerators for `tnc-ver=tnc7.0`. If you point the `policies` app at that branch while `tnc-ver=tnc6.1` is still set — or you prematurely set `tnc-ver=tnc7.0` before finish — day-2 can fight the upgrade policies (especially operator Subscriptions pinned with `installPlanApproval: Manual`).
+
+| Family | Unbind before GitOps switch | Rebind after finish |
+|--------|-----------------------------|---------------------|
+| TNC hub day-2 | remove `tnc-ver` | `tnc-ver=tnc7.0` |
+
+Feature selectors (`odf-int`, `kafka`, `idm`, `optional`, etc.) normally stay bound; they gate config policies, not the platform upgrade sequence. If a specific day-2 policy conflicts during a hop, temporarily remove that label and restore it after finish.
+
+[source,bash]
+----
+# Unbind TNC 6.1 day-2 (do this BEFORE changing policies targetRevision)
+oc label managedcluster mgmt1 tnc-ver-
+
+oc get managedcluster mgmt1 --show-labels | tr ',' '\n' | grep tnc-ver || echo "tnc-ver cleared"
+----
+
+Leave `tnc-ver` unset through both hops and finish.
+
+[#gitops-switch]
+== Switch the policy app to `tnc7.0-release-4.22`
+
+The ArgoCD application `policies` renders hub configuration from Git. Move it from the 4.20 / TNC 6.1 branch to the 4.22 / TNC 7.0 branch so upgrade PolicyGenerators and post-upgrade day-2 pins are available.
+
+. On `tnc7.0-release-4.22`, confirm the upgrade generators are listed in link:kustomization.yaml[`kustomization.yaml`] and push if needed:
++
+[source,yaml]
+----
+generators:
+  # ...
+  - mgmt-ztp-upgrade-21.yaml
+  - mgmt-ztp-upgrade-22.yaml
+  - mgmt-ztp-upgrade-finish.yaml
+----
+
+. Point the hub `policies` app at the 7.0 branch.
++
+If the Application is managed only on `mgmt1` (not owned by another GitOps path), you can patch it live (as `mano1`):
++
+[source,bash]
+----
+oc get apps -n openshift-gitops policies -o yaml | yq '.spec.source'
+
+oc patch application policies -n openshift-gitops --type=merge -p '
+spec:
+  source:
+    targetRevision: tnc7.0-release-4.22
+'
+
+# Confirm
+oc get apps -n openshift-gitops policies -o yaml | yq '.spec.source'
+# path: tnc-reference/tnc-mgmt-ztp/configuration
+# repoURL: http://git.example.com:3300/tnc-github.git
+# targetRevision: tnc7.0-release-4.22
+----
++
+[IMPORTANT]
+====
+If hub ArgoCD settings (including the `policies` Application `targetRevision`) are defined by *kustomize* on the global hub and synced by GitOps, change them in that Git source of truth — not with a one-off `oc patch`. A live patch will be reverted when the owning app self-heals.
+
+For lab `mgmt1`, update link:../../tnc-ghub/configuration/overlays/gitops-ztp/policies-app-patch.yaml[`tnc-ghub/configuration/overlays/gitops-ztp/policies-app-patch.yaml`] (`targetRevision: tnc7.0-release-4.22`), commit/push, and wait for the global hub path to sync.
+====
+
+. Wait for sync (automated selfHeal is enabled) or refresh manually in the GitOps UI / CLI:
++
+[source,bash]
+----
+oc get apps -n openshift-gitops policies
+# expect Synced / Healthy once the new revision is applied
+----
+
+. Verify upgrade policies exist:
++
+[source,bash]
+----
+oc get policies -n ztp-core-policies | grep mgmt-ztp-upgrade
+# mgmt-ztp-upgrade-prep-21|logging-uninstall-21|logging-install-21|ocp-21|odf-uninstall-21|odf-install-21|olm-21|validate-21
+# mgmt-ztp-upgrade-prep-22|ocp-22|odf-uninstall-22|odf-install-22|olm-22|validate-22
+# mgmt-ztp-upgrade-workers-1|2|3
+----
+
+[NOTE]
+====
+With `prune: true`, policies that existed only on `tnc6.1-release-4.20` and are absent from `tnc7.0-release-4.22` are removed on sync. That is expected: hub day-2 selection remains off until `tnc-ver` is restored after finish.
+====
+
+[#subscription-uninstall]
+== Subscription delete/reinstall policies
+
+Hub day-2 (`mgmt-baseline`) pins several operator Subscriptions with `installPlanApproval: Manual`. During upgrade, changing channel and asserting `status.state: AtLatestKnown` on the existing Subscription does *not* reliably advance the installed CSV when Manual approval blocks new InstallPlans.
+
+The upgrade PolicyGenerators therefore use paired policies: `complianceType: mustnothave` (delete Subscription and, for ODF, the labeled `odf-operator` CSV) followed by a reinstall policy with `installPlanApproval: Automatic` and the target channel.
+
+Uninstall policies set `evaluationInterval.compliant: never` so they stop re-evaluating once Compliant. That prevents the uninstall policy from going NonCompliant again when the paired install policy recreates the Subscription (and CSV). Each install policy declares `extraDependencies` on its uninstall counterpart so ACM will not apply install until uninstall has succeeded.
+
+==== `mgmt-ztp-upgrade-logging-uninstall-21`
+
+Removes the `cluster-logging` and `loki-operator` Subscriptions (60s soak). Runs on the *4.21* hop only.
+
+[NOTE]
+====
+**Why uninstall (Subscriptions only)**
+
+Day-2 pins `cluster-logging` and `loki-operator` with `installPlanApproval: Manual` and the pre-upgrade channel (`stable-6.2`). Patching channel and setting `AtLatestKnown` on the existing Subscription does not advance the installed CSV when Manual approval blocks new InstallPlans.
+
+This policy deletes *Subscriptions only*. It does **not** remove LokiStack, ClusterLogForwarder, or other logging custom resources. This hop is a 6.2 → 6.5 channel move, not the older v5 → v6 migration that requires CR cleanup.
+
+`mgmt-ztp-upgrade-logging-install-21` follows immediately: it recreates namespace, OperatorGroup, and Subscriptions at `stable-6.5` with `installPlanApproval: Automatic` and pins `cluster-logging.v6.5.0`. The uninstall policy uses `evaluationInterval.compliant: never` so it does not fight the install policy after subscriptions are recreated.
+====
+
+==== `mgmt-ztp-upgrade-odf-uninstall-21` and `mgmt-ztp-upgrade-odf-uninstall-22`
+
+Removes the `odf-operator` Subscription and the pre-upgrade `odf-operator` ClusterServiceVersion (60s soak). Runs after the OCP hop on each y-stream so the reinstall targets `stable-4.21` or `stable-4.22`.
+
+[NOTE]
+====
+**Why uninstall (Subscription + odf-operator CSV)**
+
+Day-2 pins the `odf-operator` Subscription with `installPlanApproval: Manual`. Channel bump plus `AtLatestKnown` does not reliably move ODF and its child operator CSVs to the target release line.
+
+Deleting the Subscription alone often leaves the `odf-operator` CSV in `Succeeded` (especially with a live internal `StorageCluster`). The policy also uses `mustnothave` on the `odf-operator` CSV, matched by label rather than a version-specific name:
+
+* `objectSelector.matchLabels`: `odf.openshift.io/odf-operator: "true"`
+* `metadata.namespace`: `openshift-storage`
+
+Do **not** set `metadata.name` on link:other-crs/optional/ODF/OdfOperatorCSV.yaml[`OdfOperatorCSV.yaml`] — PolicyGenerator ignores `objectSelector` when a name is present.
+
+Before **each** hop CGU, on `mgmt1`, confirm the label is present on the CSV to be removed:
+
+[source,bash]
+----
+oc get csv -n openshift-storage -l odf.openshift.io/odf-operator=true \
+  -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,LABELS:.metadata.labels.odf\\.openshift\\.io/odf-operator
+----
+
+This does **not** delete internal storage (`mgmt-odf-internal` / `OdfStorageCluster` CRs) or child-operator CSVs (`ocs-operator`, `rook-ceph-operator`, etc.).
+
+The paired install policy recreates namespace, OperatorGroup, and Subscription at the target channel with `installPlanApproval: Automatic`. The uninstall policy uses `evaluationInterval.compliant: never` so it does not delete the subscription or CSV again after install succeeds.
+====
+
+On the *4.22* hop, logging Subscriptions remain at `stable-6.5` from hop 1; `mgmt-ztp-upgrade-olm-22` only asserts `AtLatestKnown`.
+
+[#hop21]
+== Hop 1: 4.20.16 → 4.21.24
+
+=== Bind and enforce
+
+[source,bash]
+----
+oc label managedcluster mgmt1 upgrade-version-4-21=""
+----
+
+Apply CGU:
+
+[source,yaml]
+----
+apiVersion: ran.openshift.io/v1alpha1
+kind: ClusterGroupUpgrade
+metadata:
+  name: mgmt-upgrade-21
+  namespace: ztp-core-policies
+spec:
+  actions:
+    afterCompletion:
+      deleteClusterLabels:
+        upgrade-version-4-21: ""
+      deleteObjects: true
+  clusters:
+  - mgmt1
+  enable: true
+  managedPolicies:
+  - mgmt-ztp-upgrade-prep-21
+  - mgmt-ztp-upgrade-logging-uninstall-21
+  - mgmt-ztp-upgrade-logging-install-21
+  - mgmt-ztp-upgrade-ocp-21
+  - mgmt-ztp-upgrade-odf-uninstall-21
+  - mgmt-ztp-upgrade-odf-install-21
+  - mgmt-ztp-upgrade-olm-21
+  - mgmt-ztp-upgrade-validate-21
+  remediationStrategy:
+    maxConcurrency: 1
+    timeout: 480
+----
+
+[source,bash]
+----
+oc apply -f upgrade-cgus/mgmt-upgrade-21-cgu.yaml
+oc get clustergroupupgrade -n ztp-core-policies mgmt-upgrade-21 -w
+----
+
+Prep remediates Red Hat *and* certified catalogs to `:v4.21` and pauses worker MCPs. Logging uninstall/install cycles Subscriptions to `stable-6.5` with Automatic approval. OCP remediates to *4.21.24*. ODF uninstall/install moves the external operator to `stable-4.21`. OLM advances remaining hub Subscriptions to `AtLatestKnown`.
+
+=== Verify hop 1
+
+[source,bash]
+----
+oc get clusterversion
+# 4.21.24 Available=True Progressing=False
+
+oc get mcp
+# master Updated; workers still paused
+
+oc get catalogsource -n openshift-marketplace
+# both catalogs READY at :v4.21
+
+oc get subscription -n openshift-logging cluster-logging -o jsonpath='{.spec.channel}{" "}{.spec.installPlanApproval}{"\n"}'
+# stable-6.5 Automatic
+
+oc get subscription -n openshift-operators-redhat loki-operator -o jsonpath='{.spec.channel}{" "}{.spec.installPlanApproval}{"\n"}'
+# stable-6.5 Automatic
+
+oc get subscription -n openshift-storage odf-operator -o jsonpath='{.spec.channel}{" "}{.spec.installPlanApproval}{"\n"}'
+# stable-4.21 Automatic
+----
+
+Leave workers paused. Do *not* restore `tnc-ver` yet.
+
+[#hop22]
+== Hop 2: 4.21.24 → 4.22.5
+
+=== Bind and enforce
+
+[source,bash]
+----
+oc label managedcluster mgmt1 upgrade-version-4-22=""
+----
+
+[source,yaml]
+----
+apiVersion: ran.openshift.io/v1alpha1
+kind: ClusterGroupUpgrade
+metadata:
+  name: mgmt-upgrade-22
+  namespace: ztp-core-policies
+spec:
+  actions:
+    afterCompletion:
+      deleteClusterLabels:
+        upgrade-version-4-22: ""
+      deleteObjects: true
+  clusters:
+  - mgmt1
+  enable: true
+  managedPolicies:
+  - mgmt-ztp-upgrade-prep-22
+  - mgmt-ztp-upgrade-ocp-22
+  - mgmt-ztp-upgrade-odf-uninstall-22
+  - mgmt-ztp-upgrade-odf-install-22
+  - mgmt-ztp-upgrade-olm-22
+  - mgmt-ztp-upgrade-validate-22
+  remediationStrategy:
+    maxConcurrency: 1
+    timeout: 480
+  blockingCRs:
+  - name: mgmt-upgrade-21
+    namespace: ztp-core-policies
+----
+
+[source,bash]
+----
+oc apply -f upgrade-cgus/mgmt-upgrade-22-cgu.yaml
+oc get clustergroupupgrade -n ztp-core-policies mgmt-upgrade-22 -w
+----
+
+Prep moves catalogs to `:v4.22` and keeps workers paused. OCP remediates to *4.22.5*. ODF uninstall/install moves the external operator to `stable-4.22`. OLM asserts remaining Subscriptions at `AtLatestKnown` (logging stays on `stable-6.5`).
+
+=== Verify hop 2
+
+[source,bash]
+----
+oc get clusterversion
+# 4.22.5 Available=True Progressing=False
+
+oc get catalogsource -n openshift-marketplace
+# both catalogs READY at :v4.22
+
+oc get subscription -n openshift-storage odf-operator -o jsonpath='{.spec.channel}{" "}{.spec.installPlanApproval}{"\n"}'
+# stable-4.22 Automatic
+
+oc get mcp
+# workers still paused
+----
+
+[#finish]
+== Finish: release worker MCPs
+
+After *4.22.5* control plane is stable:
+
+[source,bash]
+----
+oc label managedcluster mgmt1 upgrade-finish=""
+----
+
+[source,yaml]
+----
+apiVersion: ran.openshift.io/v1alpha1
+kind: ClusterGroupUpgrade
+metadata:
+  name: mgmt-upgrade-finish
+  namespace: ztp-core-policies
+spec:
+  actions:
+    afterCompletion:
+      deleteClusterLabels:
+        upgrade-finish: ""
+      deleteObjects: true
+  clusters:
+  - mgmt1
+  enable: true
+  managedPolicies:
+  - mgmt-ztp-upgrade-workers-1
+  - mgmt-ztp-upgrade-workers-2
+  - mgmt-ztp-upgrade-workers-3
+  remediationStrategy:
+    maxConcurrency: 1
+    timeout: 480
+  blockingCRs:
+  - name: mgmt-upgrade-22
+    namespace: ztp-core-policies
+----
+
+[source,bash]
+----
+oc apply -f mgmt-upgrade-finish-cgu.yaml
+oc get clustergroupupgrade -n ztp-core-policies mgmt-upgrade-finish -w
+
+oc get mcp
+oc get nodes
+----
+
+Expect worker MCP(s) to unpause, update, and return to Updated=True.
+
+[#post-hop]
+== Post-upgrade GitOps alignment
+
+The `policies` app should already be on `tnc7.0-release-4.22`. After finish succeeds, restore selectors so the TNC 7.0 day-2 policies select the cluster:
+
+[source,bash]
+----
+oc get apps -n openshift-gitops policies -o yaml | yq '.spec.source.targetRevision'
+# expect tnc7.0-release-4.22
+
+oc label managedcluster mgmt1 tnc-ver=tnc7.0 --overwrite
+----
+
+Update install site labels if needed (for example link:../install/mgmt1-no-bond.yaml[`install/mgmt1-no-bond.yaml`]) so future syncs do not re-apply `tnc-ver=tnc6.1`.
+
+After the label is restored, day-2 policies select the cluster again in *inform* mode. Enforce any remaining NonCompliant policies with a CGU (ordered by `ztp-deploy-wave`). Example for lab `mgmt1` with internal ODF, kafka, IDM, and optional components:
+
+[source,yaml]
+----
+apiVersion: ran.openshift.io/v1alpha1
+kind: ClusterGroupUpgrade
+metadata:
+  name: mgmt-day2-align
+  namespace: ztp-core-policies
+spec:
+  actions:
+    afterCompletion:
+      deleteObjects: true
+  clusters:
+  - mgmt1
+  enable: true
+  managedPolicies:
+  - mgmt-cluster-config-tnc70
+  - kafka-subs-tnc70
+  - mgmt-operator-subs-tnc70
+  - kafka-config-tnc70
+  - mgmt-operator-config-tnc70
+  - operator-lso-tnc70
+  - config-lso-tnc70
+  - config-odf-int-tnc70
+  - mgmt-kafka-step1-tnc70
+  - config-other-int-tnc70
+  - mgmt-kafka-step2-tnc70
+  - quay-tnc70
+  - optional-tnc70
+  - ztp-tnc70
+  - argo-talm-tnc70
+  - gitops-config-tnc70
+  - mgmt-auth-idm-tnc70
+  - mgmt-post-auth-idm-tnc70
+  remediationStrategy:
+    maxConcurrency: 1
+    timeout: 480
+----
+
+[source,bash]
+----
+oc apply -f mgmt-day2-align-cgu.yaml
+oc get clustergroupupgrade -n ztp-core-policies mgmt-day2-align -w
+oc get policies -n mgmt1 | grep Non || echo "all Compliant"
+----
+
+Optionally comment the upgrade generators back out of `kustomization.yaml` when no other clusters need them (placements are label-gated), then allow ArgoCD to sync.
+
+== What not to do
+
+* Do *not* change the `policies` app `targetRevision` to `tnc7.0-release-4.22` while `tnc-ver=tnc6.1` is still set — or bind `tnc-ver=tnc7.0` before finish — without understanding day-2 vs upgrade conflicts.
+* Do *not* unpause workers between the 4.21 and 4.22 hops.
+* Do *not* skip 4.21.24 (y-stream must be sequential).
+* Do *not* leave `tnc-ver=tnc6.1` bound during CGUs.
+* Do *not* bind `tnc-ver=tnc7.0` until both hops and finish complete.
+* Do *not* rely on channel bump + `AtLatestKnown` alone for hub logging or ODF when day-2 pins `installPlanApproval: Manual` — use the dedicated uninstall/install policies (see <<subscription-uninstall>>).
+* Do *not* delete LokiStack, ClusterLogForwarder, or `OdfStorageCluster` CRs as part of the subscription cycle; only the `odf-operator` Subscription and its CSV are removed and recreated (child ODF operator CSVs are untouched).
+* Do *not* point the hub `policies` app back at `tnc6.1-release-4.20` after the cluster is on 4.22.
