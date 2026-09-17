@@ -40,7 +40,7 @@ policies:
               - kind: ClusterServiceVersion
                 namespace: openshift-logging
                 # Updated with specific target version 08-31-2026
-                name: cluster-logging.v6.5.1
+                name: cluster-logging.v6.6.0
                 conditions:
                   - type: Succeeded
                     status: "True"
@@ -59,7 +59,7 @@ policies:
         patches:
         - spec:
             installPlanApproval: Manual
-            channel: stable-6.5
+            channel: stable-6.6
 #COO - Pre-requisite for logging UI
       - path: other-crs/optional/COO/CooSubscription.yaml
 #ESO

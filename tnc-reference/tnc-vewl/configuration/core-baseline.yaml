@@ -2,7 +2,7 @@
 apiVersion: policy.open-cluster-management.io/v1
 kind: PolicyGenerator
 metadata:
-  name: core-baseline-19
+  name: core-baseline-22
 policyDefaults:
   namespace: ztp-core-policies
   policySets: []
@@ -40,7 +40,7 @@ policies:
               - kind: ClusterServiceVersion
                 namespace: openshift-logging
                 # Update with specific target version
-                name: cluster-logging.v6.5.0
+                name: cluster-logging.v6.6.0
                 conditions:
                   - type: Succeeded
                     status: "True"

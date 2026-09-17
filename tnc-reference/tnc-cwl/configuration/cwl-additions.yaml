@@ -38,7 +38,7 @@ policies:
         patches:
         - spec:
             installPlanApproval: Manual
-            channel: stable-6.5
+            channel: stable-6.6
 #ESO
       - path: other-crs/required/vault/ESO/ESONS.yaml
       - path: other-crs/required/vault/ESO/ESOOperGroup.yaml

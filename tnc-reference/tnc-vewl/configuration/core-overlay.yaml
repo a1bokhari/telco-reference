@@ -102,6 +102,14 @@ policies:
             nodeSelector:
               node-role.kubernetes.io/worker-3: ""
 
+      # Control plane PerformanceProfile
+      - path: reference-crs/required/performance/PerformanceProfile-control-plane.yaml
+        patches:
+        - spec:
+            cpu:
+              reserved: '{{hub fromConfigMap "" "hw-types" "control-plane-reserved" | toLiteral hub}}'
+              isolated: '{{hub fromConfigMap "" "hw-types" "control-plane-isolated" | toLiteral hub}}'
+
       # TuneD performance patches for core
 #      - path: reference-crs/required/performance/TunedPerformancePatch.yaml
 #        patches:
