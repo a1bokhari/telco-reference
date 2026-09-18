@@ -34,19 +34,10 @@ policies:
         patches:
         - data:
             "ack-4.20-sigstore-in-4.21": "true"
-      - path: reference-crs/custom-manifests/mcp-worker-1.yaml
+      - path: other-crs/custom-manifests/mcp-worker.yaml
         patches:
         - spec:
-            maxUnavailable: 100%
-            paused: true
-      - path: reference-crs/custom-manifests/mcp-worker-2.yaml
-        patches:
-        - spec:
-            maxUnavailable: 100%
-            paused: true
-      - path: reference-crs/custom-manifests/mcp-worker-3.yaml
-        patches:
-        - spec:
+            # Adjust as needed based on spare capacity, cluster design, and application requirements
             maxUnavailable: 100%
             paused: true
   - name: mgmt-ztp-upgrade-logging-uninstall-21
